@@ -408,6 +408,263 @@ def get_attention_values(
     return result
 
 
+def get_all_frames_attention(
+    attn_weights: torch.Tensor,
+    images: torch.Tensor,
+    token_idx: int,
+    head_idx: int = 0,
+    patch_start_idx: int = 5,
+    frame_indices: Optional[List[int]] = None
+) -> Dict:
+    """
+    Extract frame attention maps for multiple frames.
+
+    Args:
+        attn_weights: Frame attention weights [B*S, num_heads, N, N]
+        images: Images tensor [B, S, 3, H, W] or [S, 3, H, W]
+        token_idx: Token index to extract attention from
+        head_idx: Attention head index
+        patch_start_idx: Index where patch tokens start
+        frame_indices: List of frame indices to extract, None means all frames
+
+    Returns:
+        Dictionary containing:
+            - 'attention_maps': numpy array [num_frames, grid_h, grid_w]
+            - 'attention_maps_resized': numpy array [num_frames, H, W]
+            - 'images': numpy array [num_frames, H, W, 3]
+            - 'frame_indices': list of extracted frame indices
+            - 'metadata': dict with grid_h, grid_w, H, W, S, token_idx, head_idx
+    """
+    # Ensure images has batch dimension
+    if len(images.shape) == 4:
+        images = images.unsqueeze(0)
+
+    B, S, C, H, W = images.shape
+
+    # If frame_indices not specified, use all frames
+    if frame_indices is None:
+        frame_indices = list(range(S))
+
+    # Calculate grid dimensions
+    patch_size = 14
+    grid_h = H // patch_size
+    grid_w = W // patch_size
+    num_patches = grid_h * grid_w
+
+    # Convert images to numpy
+    images_np = images[0].permute(0, 2, 3, 1).cpu().numpy()
+    images_np = np.clip(images_np, 0, 1)
+
+    results = {
+        'attention_maps': [],
+        'attention_maps_resized': [],
+        'images': images_np,
+        'frame_indices': frame_indices,
+        'metadata': {
+            'grid_h': grid_h,
+            'grid_w': grid_w,
+            'H': H,
+            'W': W,
+            'S': S,
+            'token_idx': token_idx,
+            'head_idx': head_idx,
+            'patch_start_idx': patch_start_idx,
+            'attention_type': 'frame'
+        }
+    }
+
+    # Extract attention for each frame
+    for frame_idx in frame_indices:
+        # Extract attention for this frame
+        attn = attn_weights[frame_idx, head_idx, token_idx, :].numpy()
+
+        # Remove special tokens
+        attn_patches = attn[patch_start_idx:patch_start_idx + num_patches]
+
+        # Reshape to spatial grid
+        attn_map = attn_patches.reshape(grid_h, grid_w)
+
+        # Resize to image resolution
+        attn_resized = F.interpolate(
+            torch.from_numpy(attn_map).unsqueeze(0).unsqueeze(0),
+            size=(H, W),
+            mode='bilinear',
+            align_corners=False
+        ).squeeze().numpy()
+
+        results['attention_maps'].append(attn_map)
+        results['attention_maps_resized'].append(attn_resized)
+
+    # Convert to numpy arrays
+    results['attention_maps'] = np.array(results['attention_maps'])
+    results['attention_maps_resized'] = np.array(results['attention_maps_resized'])
+
+    return results
+
+
+def visualize_frame_attention(
+    attn_weights: torch.Tensor,
+    images: torch.Tensor,
+    token_idx: int,
+    head_idx: int = 0,
+    patch_start_idx: int = 5,
+    frame_idx: int = 0,
+    layer_name: str = '',
+    cmap: str = 'turbo',
+    alpha: float = 0.6,
+    figsize: Tuple[int, int] = (12, 5)
+) -> plt.Figure:
+    """
+    Visualize frame attention for a specific frame.
+
+    Args:
+        attn_weights: Frame attention weights [B*S, num_heads, N, N]
+        images: Images tensor [B, S, 3, H, W] or [S, 3, H, W]
+        token_idx: Token index to visualize
+        head_idx: Attention head index
+        patch_start_idx: Index where patch tokens start
+        frame_idx: Which frame to visualize (0 to S-1)
+        layer_name: Name of the layer for title
+        cmap: Colormap to use
+        alpha: Transparency of attention overlay
+        figsize: Figure size
+
+    Returns:
+        matplotlib Figure object
+    """
+    if len(images.shape) == 4:
+        images = images.unsqueeze(0)
+
+    B, S, C, H, W = images.shape
+
+    # Validate frame_idx
+    if frame_idx >= S or frame_idx < 0:
+        raise ValueError(f"frame_idx {frame_idx} is out of range [0, {S-1}]")
+
+    # Calculate grid dimensions
+    patch_size = 14
+    grid_h = H // patch_size
+    grid_w = W // patch_size
+    num_patches = grid_h * grid_w
+
+    # Extract attention for specified frame
+    attn = attn_weights[frame_idx, head_idx, token_idx, :].numpy()
+    attn_patches = attn[patch_start_idx:patch_start_idx + num_patches]
+    attn_map = attn_patches.reshape(grid_h, grid_w)
+
+    # Create visualization
+    fig, axes = plt.subplots(1, 2, figsize=figsize)
+
+    # Original image
+    img_np = images[0, frame_idx].permute(1, 2, 0).cpu().numpy()
+    img_np = np.clip(img_np, 0, 1)
+    axes[0].imshow(img_np)
+    axes[0].set_title(f'Original Image (Frame {frame_idx})')
+    axes[0].axis('off')
+
+    # Attention overlay
+    axes[1].imshow(img_np)
+    attn_resized = F.interpolate(
+        torch.from_numpy(attn_map).unsqueeze(0).unsqueeze(0),
+        size=(H, W),
+        mode='bilinear',
+        align_corners=False
+    ).squeeze().numpy()
+
+    im = axes[1].imshow(attn_resized, cmap=cmap, alpha=alpha, vmin=0, vmax=attn_resized.max())
+    axes[1].set_title(f'Frame Attention from Token {token_idx}\n{layer_name}, Head {head_idx}, Frame {frame_idx}')
+    axes[1].axis('off')
+
+    plt.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04, label='Attention Weight')
+    plt.tight_layout()
+
+    return fig
+
+
+def visualize_all_frames_attention(
+    attn_weights: torch.Tensor,
+    images: torch.Tensor,
+    token_idx: int,
+    head_idx: int = 0,
+    patch_start_idx: int = 5,
+    frame_indices: Optional[List[int]] = None,
+    layer_name: str = '',
+    cmap: str = 'turbo',
+    alpha: float = 0.6,
+    figsize: Optional[Tuple[int, int]] = None
+) -> plt.Figure:
+    """
+    Visualize frame attention for all specified frames in a single figure.
+
+    Args:
+        attn_weights: Frame attention weights [B*S, num_heads, N, N]
+        images: Images tensor [B, S, 3, H, W] or [S, 3, H, W]
+        token_idx: Token index to visualize
+        head_idx: Attention head index
+        patch_start_idx: Index where patch tokens start
+        frame_indices: List of frame indices to visualize, None means all frames
+        layer_name: Name of the layer for title
+        cmap: Colormap to use
+        alpha: Transparency of attention overlay
+        figsize: Figure size (auto-calculated if None)
+
+    Returns:
+        matplotlib Figure object
+    """
+    # Get all frames attention data
+    all_frames_data = get_all_frames_attention(
+        attn_weights=attn_weights,
+        images=images,
+        token_idx=token_idx,
+        head_idx=head_idx,
+        patch_start_idx=patch_start_idx,
+        frame_indices=frame_indices
+    )
+
+    frame_indices = all_frames_data['frame_indices']
+    num_frames = len(frame_indices)
+
+    # Auto-calculate figure size if not specified
+    if figsize is None:
+        figsize = (5 * num_frames, 10)
+
+    # Create visualization
+    fig, axes = plt.subplots(2, num_frames, figsize=figsize)
+    if num_frames == 1:
+        axes = axes.reshape(2, 1)
+
+    for i, frame_idx in enumerate(frame_indices):
+        # Original image
+        img_np = all_frames_data['images'][frame_idx]
+        axes[0, i].imshow(img_np)
+        axes[0, i].set_title(f'Frame {frame_idx}')
+        axes[0, i].axis('off')
+
+        # Attention overlay
+        axes[1, i].imshow(img_np)
+        attn_resized = all_frames_data['attention_maps_resized'][i]
+        im = axes[1, i].imshow(
+            attn_resized,
+            cmap=cmap,
+            alpha=alpha,
+            vmin=0,
+            vmax=all_frames_data['attention_maps_resized'].max()
+        )
+        axes[1, i].set_title(f'Frame Attention (Frame {frame_idx})')
+        axes[1, i].axis('off')
+
+    plt.suptitle(
+        f'Frame Attention from Token {token_idx}\n{layer_name}, Head {head_idx}',
+        fontsize=14,
+        fontweight='bold',
+        y=0.98
+    )
+    plt.colorbar(im, ax=axes[1, -1], fraction=0.046, pad=0.04, label='Attention Weight')
+    plt.tight_layout()
+
+    return fig
+
+
 def extract_both_attentions(
     model: VGGT,
     images: torch.Tensor,
