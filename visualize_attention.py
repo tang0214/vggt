@@ -291,6 +291,123 @@ def visualize_attention_on_image(
     return fig
 
 
+def get_attention_values(
+    attn_weights: torch.Tensor,
+    images: torch.Tensor,
+    token_idx: int,
+    head_idx: int = 0,
+    patch_start_idx: int = 5,
+    attention_type: str = 'frame'
+) -> Dict:
+    """
+    Extract attention weight values without visualization.
+    Same inputs as visualize_attention_on_image but returns pure numpy arrays.
+
+    Args:
+        attn_weights: Attention weights tensor
+                     - Frame attention: [B*S, num_heads, P+special_tokens, P+special_tokens]
+                     - Global attention: [B, num_heads, S*P+special_tokens, S*P+special_tokens]
+        images: Original images tensor [B, S, 3, H, W] or [S, 3, H, W]
+        token_idx: Which token (patch) to visualize attention from (should be >= patch_start_idx)
+        head_idx: Which attention head to extract
+        patch_start_idx: Index where patch tokens start (after camera/register tokens)
+        attention_type: 'frame' or 'global'
+
+    Returns:
+        Dictionary containing:
+            - 'attention_maps': numpy array of attention maps
+                - Frame: [grid_h, grid_w] - single frame attention map
+                - Global: [S, grid_h, grid_w] - attention map for each frame
+            - 'attention_maps_resized': numpy array resized to image resolution
+                - Frame: [H, W]
+                - Global: [S, H, W]
+            - 'images': numpy array of images [S, H, W, 3] in range [0, 1]
+            - 'metadata': dict with grid_h, grid_w, H, W, S, token_idx, head_idx
+    """
+    # Ensure images has batch dimension
+    if len(images.shape) == 4:
+        images = images.unsqueeze(0)  # [B, S, 3, H, W]
+
+    B, S, C, H, W = images.shape
+
+    # Calculate grid dimensions
+    patch_size = 14  # VGGT default
+    grid_h = H // patch_size
+    grid_w = W // patch_size
+    num_patches = grid_h * grid_w
+
+    # Convert images to numpy [S, H, W, 3]
+    images_np = images[0].permute(0, 2, 3, 1).cpu().numpy()
+    images_np = np.clip(images_np, 0, 1)
+
+    result = {
+        'images': images_np,
+        'metadata': {
+            'grid_h': grid_h,
+            'grid_w': grid_w,
+            'H': H,
+            'W': W,
+            'S': S,
+            'token_idx': token_idx,
+            'head_idx': head_idx,
+            'attention_type': attention_type,
+            'patch_start_idx': patch_start_idx
+        }
+    }
+
+    if attention_type == 'frame':
+        # Frame attention: [B*S, num_heads, N, N] where N = patches + special tokens
+        # Extract attention for the specified token
+        attn = attn_weights[0, head_idx, token_idx, :].numpy()  # Use first frame
+
+        # Remove special tokens (only keep patch tokens)
+        attn_patches = attn[patch_start_idx:patch_start_idx + num_patches]
+
+        # Reshape to spatial grid [grid_h, grid_w]
+        attn_map = attn_patches.reshape(grid_h, grid_w)
+
+        # Resize to image resolution [H, W]
+        attn_resized = F.interpolate(
+            torch.from_numpy(attn_map).unsqueeze(0).unsqueeze(0),
+            size=(H, W),
+            mode='bilinear',
+            align_corners=False
+        ).squeeze().numpy()
+
+        result['attention_maps'] = attn_map
+        result['attention_maps_resized'] = attn_resized
+
+    elif attention_type == 'global':
+        # Global attention: [B, num_heads, S*P+special_tokens, S*P+special_tokens]
+        # Extract attention for the specified token
+        attn = attn_weights[0, head_idx, token_idx, :].numpy()
+
+        # Remove special tokens and reshape to [S, P]
+        attn_patches = attn[patch_start_idx:patch_start_idx + S * num_patches]
+        attn_per_frame = attn_patches.reshape(S, num_patches)
+
+        # Reshape each frame to spatial grid [S, grid_h, grid_w]
+        attn_maps = np.array([attn_per_frame[i].reshape(grid_h, grid_w) for i in range(S)])
+
+        # Resize to image resolution [S, H, W]
+        attn_resized_list = []
+        for frame_idx in range(S):
+            attn_resized = F.interpolate(
+                torch.from_numpy(attn_maps[frame_idx]).unsqueeze(0).unsqueeze(0),
+                size=(H, W),
+                mode='bilinear',
+                align_corners=False
+            ).squeeze().numpy()
+            attn_resized_list.append(attn_resized)
+
+        attn_resized = np.array(attn_resized_list)  # [S, H, W]
+
+        result['attention_maps'] = attn_maps  # [S, grid_h, grid_w]
+        result['attention_maps_resized'] = attn_resized  # [S, H, W]
+
+    return result
+
+
 def extract_both_attentions(
     model: VGGT,
     images: torch.Tensor,

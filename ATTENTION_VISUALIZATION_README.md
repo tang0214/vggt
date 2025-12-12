@@ -13,7 +13,12 @@
 - Frame Attention：幀內的 self-attention
 - Global Attention：跨幀的 cross-frame attention，會分別顯示每一幀
 
-### 3. **靈活的參數設定**
+### 3. **提取純數值 Attention Maps**
+- 新增 `get_attention_values()` 函數
+- 返回 numpy arrays 而非圖片，方便後續處理
+- 可自行儲存、分析或客製化可視化
+
+### 4. **靈活的參數設定**
 - 選擇任意 block (0-23)
 - 選擇任意 attention head (0-15)
 - 選擇任意 token 進行可視化
@@ -123,6 +128,121 @@ fig = visualize_attention_on_image(
 **Global Attention 輸出：**
 - 上排：所有幀的原始影像
 - 下排：每一幀的 attention heatmap
+
+### `get_attention_values()`
+提取純數值的 attention weights，不做可視化。與 `visualize_attention_on_image()` 參數完全相同，但返回 numpy arrays 而非圖片。
+
+**用途：**
+- 需要自己處理 attention 數據
+- 要儲存 attention maps 做後續分析
+- 想要客製化可視化方式
+
+**參數：**（與 `visualize_attention_on_image()` 相同）
+- `attn_weights`: Attention weights tensor
+- `images`: 原始影像 tensor
+- `token_idx`: 要提取的 token 索引
+- `head_idx`: Attention head 索引
+- `patch_start_idx`: Patch tokens 起始索引
+- `attention_type`: 'frame' 或 'global'
+
+**返回字典結構：**
+```python
+{
+    'attention_maps': np.ndarray,
+        # Frame: [grid_h, grid_w] - 原始 patch 解析度
+        # Global: [S, grid_h, grid_w] - 每一幀的 attention map
+
+    'attention_maps_resized': np.ndarray,
+        # Frame: [H, W] - 放大到影像解析度
+        # Global: [S, H, W] - 每一幀放大後的 attention map
+
+    'images': np.ndarray,  # [S, H, W, 3] - 原始影像，range [0, 1]
+
+    'metadata': {
+        'grid_h': int,           # patch grid 高度
+        'grid_w': int,           # patch grid 寬度
+        'H': int,                # 影像高度
+        'W': int,                # 影像寬度
+        'S': int,                # 影像數量
+        'token_idx': int,        # 查詢的 token
+        'head_idx': int,         # attention head
+        'attention_type': str,   # 'frame' or 'global'
+        'patch_start_idx': int   # patch tokens 起始索引
+    }
+}
+```
+
+**使用範例：**
+```python
+from visualize_attention import get_attention_values
+
+# 提取 attention
+result = extract_both_attentions(model, images, block_idx=23)
+
+# 取得純數值（不做可視化）
+values = get_attention_values(
+    attn_weights=result['global_attention']['attn_weights'],
+    images=images,
+    token_idx=500,
+    head_idx=0,
+    patch_start_idx=result['patch_start_idx'],
+    attention_type='global'
+)
+
+# Frame Attention
+frame_values = get_attention_values(
+    attn_weights=result['frame_attention']['attn_weights'],
+    images=images,
+    token_idx=500,
+    head_idx=0,
+    patch_start_idx=result['patch_start_idx'],
+    attention_type='frame'
+)
+
+# 取得 attention map
+attn_map = frame_values['attention_maps']  # [37, 37]
+attn_resized = frame_values['attention_maps_resized']  # [518, 518]
+
+print(f"Attention map shape: {attn_map.shape}")
+print(f"Attention range: [{attn_resized.min():.4f}, {attn_resized.max():.4f}]")
+
+# Global Attention - 每一幀的 attention
+global_values = get_attention_values(
+    attn_weights=result['global_attention']['attn_weights'],
+    images=images,
+    token_idx=500,
+    head_idx=0,
+    patch_start_idx=result['patch_start_idx'],
+    attention_type='global'
+)
+
+attn_maps = global_values['attention_maps']  # [3, 37, 37]
+attn_resized = global_values['attention_maps_resized']  # [3, 518, 518]
+
+# 自己客製化可視化
+import matplotlib.pyplot as plt
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+for i in range(3):
+    axes[i].imshow(attn_resized[i], cmap='turbo')
+    axes[i].set_title(f'Frame {i}')
+    axes[i].axis('off')
+plt.savefig('custom_attention.png')
+
+# 儲存成 .npy 檔案
+import numpy as np
+np.save('attention_maps.npy', attn_resized)
+```
+
+**與 `visualize_attention_on_image()` 的比較：**
+
+| 特性 | `visualize_attention_on_image()` | `get_attention_values()` |
+|------|----------------------------------|--------------------------|
+| 返回值 | matplotlib Figure | numpy arrays (dict) |
+| 用途 | 直接可視化並顯示 | 取得數值做後續處理 |
+| 輸出類型 | 圖片物件 | 純數據 + metadata |
+| 彈性 | 低（固定格式） | 高（可自由處理） |
+| 適用場景 | 快速查看結果 | 需要分析、儲存或客製化 |
 
 ## Token 索引說明
 
