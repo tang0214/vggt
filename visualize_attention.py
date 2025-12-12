@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import numpy as np
 from typing import Dict, List, Optional, Tuple
+from PIL import Image
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
 
@@ -164,6 +165,296 @@ def visualize_attention_map(
     return fig
 
 
+def visualize_attention_on_image(
+    attn_weights: torch.Tensor,
+    images: torch.Tensor,
+    token_idx: int,
+    head_idx: int = 0,
+    patch_start_idx: int = 5,
+    attention_type: str = 'frame',
+    layer_name: str = '',
+    cmap: str = 'turbo',
+    alpha: float = 0.6,
+    figsize: Tuple[int, int] = (15, 5)
+) -> plt.Figure:
+    """
+    Visualize attention weights overlaid on actual images.
+
+    Args:
+        attn_weights: Attention weights tensor
+                     - Frame attention: [B*S, num_heads, P+special_tokens, P+special_tokens]
+                     - Global attention: [B, num_heads, S*P+special_tokens, S*P+special_tokens]
+        images: Original images tensor [B, S, 3, H, W] or [S, 3, H, W]
+        token_idx: Which token (patch) to visualize attention from (should be >= patch_start_idx)
+        head_idx: Which attention head to visualize
+        patch_start_idx: Index where patch tokens start (after camera/register tokens)
+        attention_type: 'frame' or 'global'
+        layer_name: Name of the layer for the title
+        cmap: Colormap to use
+        alpha: Transparency of attention overlay
+        figsize: Figure size
+
+    Returns:
+        matplotlib Figure object
+    """
+    # Ensure images has batch dimension
+    if len(images.shape) == 4:
+        images = images.unsqueeze(0)  # [B, S, 3, H, W]
+
+    B, S, C, H, W = images.shape
+
+    # Calculate grid dimensions
+    patch_size = 14  # VGGT default
+    grid_h = H // patch_size
+    grid_w = W // patch_size
+    num_patches = grid_h * grid_w
+
+    if attention_type == 'frame':
+        # Frame attention: [B*S, num_heads, N, N] where N = patches + special tokens
+        # Extract attention for the specified token
+        attn = attn_weights[0, head_idx, token_idx, :].numpy()  # Use first frame
+
+        # Remove special tokens (only keep patch tokens)
+        attn_patches = attn[patch_start_idx:patch_start_idx + num_patches]
+
+        # Reshape to spatial grid
+        attn_map = attn_patches.reshape(grid_h, grid_w)
+
+        # Visualize on single frame
+        fig, axes = plt.subplots(1, 2, figsize=figsize)
+
+        # Original image
+        img_np = images[0, 0].permute(1, 2, 0).cpu().numpy()
+        img_np = np.clip(img_np, 0, 1)
+        axes[0].imshow(img_np)
+        axes[0].set_title('Original Image (Frame 0)')
+        axes[0].axis('off')
+
+        # Attention overlay
+        axes[1].imshow(img_np)
+        attn_resized = F.interpolate(
+            torch.from_numpy(attn_map).unsqueeze(0).unsqueeze(0),
+            size=(H, W),
+            mode='bilinear',
+            align_corners=False
+        ).squeeze().numpy()
+
+        im = axes[1].imshow(attn_resized, cmap=cmap, alpha=alpha, vmin=0, vmax=attn_resized.max())
+        axes[1].set_title(f'Frame Attention from Token {token_idx}\n{layer_name}, Head {head_idx}')
+        axes[1].axis('off')
+
+        plt.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04, label='Attention Weight')
+
+    elif attention_type == 'global':
+        # Global attention: [B, num_heads, S*P+special_tokens, S*P+special_tokens]
+        # Extract attention for the specified token
+        attn = attn_weights[0, head_idx, token_idx, :].numpy()
+
+        # Remove special tokens and reshape to [S, P]
+        attn_patches = attn[patch_start_idx:patch_start_idx + S * num_patches]
+        attn_per_frame = attn_patches.reshape(S, num_patches)
+
+        # Create subplot for each frame
+        fig, axes = plt.subplots(2, S, figsize=(5*S, 10))
+        if S == 1:
+            axes = axes.reshape(2, 1)
+
+        for frame_idx in range(S):
+            # Original image
+            img_np = images[0, frame_idx].permute(1, 2, 0).cpu().numpy()
+            img_np = np.clip(img_np, 0, 1)
+            axes[0, frame_idx].imshow(img_np)
+            axes[0, frame_idx].set_title(f'Frame {frame_idx}')
+            axes[0, frame_idx].axis('off')
+
+            # Attention overlay
+            attn_map = attn_per_frame[frame_idx].reshape(grid_h, grid_w)
+            axes[1, frame_idx].imshow(img_np)
+
+            attn_resized = F.interpolate(
+                torch.from_numpy(attn_map).unsqueeze(0).unsqueeze(0),
+                size=(H, W),
+                mode='bilinear',
+                align_corners=False
+            ).squeeze().numpy()
+
+            im = axes[1, frame_idx].imshow(attn_resized, cmap=cmap, alpha=alpha,
+                                           vmin=0, vmax=attn_per_frame.max())
+            axes[1, frame_idx].set_title(f'Attention to Frame {frame_idx}')
+            axes[1, frame_idx].axis('off')
+
+        plt.suptitle(f'Global Attention from Token {token_idx}\n{layer_name}, Head {head_idx}',
+                     fontsize=14, fontweight='bold', y=0.98)
+        plt.colorbar(im, ax=axes[1, -1], fraction=0.046, pad=0.04, label='Attention Weight')
+
+    plt.tight_layout()
+    return fig
+
+
+def extract_both_attentions(
+    model: VGGT,
+    images: torch.Tensor,
+    block_idx: int = 23,
+    dtype=torch.float16
+) -> Dict:
+    """
+    Extract both frame and global attention for a specific block.
+
+    Args:
+        model: VGGT model
+        images: Input images [B, S, 3, H, W]
+        block_idx: Which block to extract from
+        dtype: Data type for inference
+
+    Returns:
+        Dictionary containing both attention maps and metadata
+    """
+    extractor = AttentionExtractor(model)
+
+    # Register hooks for both frame and global attention
+    extractor.register_hooks(
+        block_indices=[block_idx],
+        attention_types=['frame', 'global']
+    )
+
+    # Forward pass
+    with torch.no_grad():
+        with torch.cuda.amp.autocast(dtype=dtype):
+            _ = model(images)
+
+    # Get attention maps
+    attention_maps = extractor.get_attention_maps()
+
+    # Clean up
+    extractor.clear_hooks()
+
+    # Extract data
+    frame_layer = f"frame_block_{block_idx}"
+    global_layer = f"global_block_{block_idx}"
+
+    result = {
+        'frame_attention': attention_maps.get(frame_layer, None),
+        'global_attention': attention_maps.get(global_layer, None),
+        'block_idx': block_idx,
+        'patch_start_idx': model.aggregator.patch_start_idx
+    }
+
+    return result
+
+
+def demo_visualize_token_attention(
+    image_paths: List[str],
+    block_idx: int = 23,
+    token_idx: int = 500,
+    head_idx: int = 0,
+    attention_types: List[str] = ['frame', 'global']
+):
+    """
+    Demo: Visualize a specific token's attention on actual images.
+    Shows both frame and global attention.
+
+    Args:
+        image_paths: List of image file paths
+        block_idx: Which block to visualize (0-23)
+        token_idx: Which token (patch) to visualize attention from
+        head_idx: Which attention head to visualize
+        attention_types: Which attention types to show
+    """
+    print("=" * 80)
+    print("VGGT Token Attention Visualization on Images")
+    print("=" * 80)
+
+    # Setup device
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+
+    print(f"Device: {device}")
+    print(f"Loading model...")
+
+    # Load model
+    model = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
+    model.eval()
+
+    print(f"Loading {len(image_paths)} images...")
+    images = load_and_preprocess_images(image_paths).to(device)
+
+    # Extract both attentions
+    print(f"Extracting attention from block {block_idx}...")
+    result = extract_both_attentions(model, images, block_idx=block_idx, dtype=dtype)
+
+    patch_start_idx = result['patch_start_idx']
+
+    # Calculate valid token range
+    if len(images.shape) == 4:
+        images_vis = images.unsqueeze(0)
+    else:
+        images_vis = images
+
+    S = images_vis.shape[1]  # Number of frames
+    H, W = images_vis.shape[3], images_vis.shape[4]
+    grid_h, grid_w = H // 14, W // 14
+    num_patches = grid_h * grid_w
+
+    print(f"\nImage info:")
+    print(f"  Number of frames: {S}")
+    print(f"  Image size: {H}x{W}")
+    print(f"  Grid size: {grid_h}x{grid_w}")
+    print(f"  Patches per frame: {num_patches}")
+    print(f"  Special tokens before patches: {patch_start_idx}")
+    print(f"  Valid token range for visualization: {patch_start_idx} to {patch_start_idx + num_patches - 1}")
+
+    # Adjust token_idx if needed
+    if token_idx < patch_start_idx:
+        print(f"\nWarning: token_idx {token_idx} is a special token (< {patch_start_idx})")
+        token_idx = patch_start_idx
+        print(f"Adjusted to first patch token: {token_idx}")
+    elif token_idx >= patch_start_idx + num_patches:
+        print(f"\nWarning: token_idx {token_idx} is out of range")
+        token_idx = patch_start_idx + num_patches // 2
+        print(f"Adjusted to middle patch token: {token_idx}")
+
+    figures = []
+
+    # Visualize frame attention
+    if 'frame' in attention_types and result['frame_attention'] is not None:
+        print(f"\nVisualizing frame attention...")
+        frame_attn = result['frame_attention']
+        print(f"  Frame attention shape: {frame_attn['attn_weights'].shape}")
+
+        fig = visualize_attention_on_image(
+            attn_weights=frame_attn['attn_weights'],
+            images=images_vis,
+            token_idx=token_idx,
+            head_idx=head_idx,
+            patch_start_idx=patch_start_idx,
+            attention_type='frame',
+            layer_name=f"Frame Block {block_idx}"
+        )
+        figures.append(('frame', fig))
+
+    # Visualize global attention
+    if 'global' in attention_types and result['global_attention'] is not None:
+        print(f"\nVisualizing global attention...")
+        global_attn = result['global_attention']
+        print(f"  Global attention shape: {global_attn['attn_weights'].shape}")
+
+        fig = visualize_attention_on_image(
+            attn_weights=global_attn['attn_weights'],
+            images=images_vis,
+            token_idx=token_idx,
+            head_idx=head_idx,
+            patch_start_idx=patch_start_idx,
+            attention_type='global',
+            layer_name=f"Global Block {block_idx}"
+        )
+        figures.append(('global', fig))
+
+    print(f"\nShowing {len(figures)} visualizations...")
+    plt.show()
+
+    return figures, result
+
+
 def demo_single_layer_attention(
     image_paths: List[str],
     block_idx: int = 23,
@@ -285,7 +576,23 @@ if __name__ == "__main__":
         "examples/llff_flower/images/010.png"
     ]
 
-    print("Mode 1: Visualization")
+    print("=" * 80)
+    print("NEW: Visualize Token Attention on Images")
+    print("=" * 80)
+    print("This shows attention overlaid on actual images for both frame and global attention\n")
+
+    # NEW: Visualize attention on actual images
+    figures, result = demo_visualize_token_attention(
+        image_paths,
+        block_idx=23,
+        token_idx=500,  # Will be auto-adjusted if invalid
+        head_idx=0,
+        attention_types=['frame', 'global']  # Show both
+    )
+
+    print("\n" + "=" * 80)
+    print("OLD Mode 1: Basic Visualization (token-to-token heatmap)")
+    print("=" * 80)
     demo_single_layer_attention(
         image_paths,
         block_idx=23,
@@ -295,8 +602,9 @@ if __name__ == "__main__":
         mode='visualize'
     )
 
-    print("\n" + "=" * 60)
-    print("Mode 2: Data extraction")
+    print("\n" + "=" * 80)
+    print("OLD Mode 2: Data extraction")
+    print("=" * 80)
     data = demo_single_layer_attention(
         image_paths,
         block_idx=23,
