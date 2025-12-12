@@ -293,79 +293,24 @@ token_idx = patch_idx + patch_start_idx
 - **含義**: 所有幀之間的 cross-frame attention
 - **用途**: 理解不同影像之間的對應關係（例如：tracking, 3D reconstruction）
 
-## 可視化範例
-
-### Example 1: 查看影像中心的 attention
-```python
-# 計算中心 token
-grid_size = 37
-center_patch = (grid_size // 2) * grid_size + (grid_size // 2)
-center_token = center_patch + 5  # 加上 special tokens
-
-demo_visualize_token_attention(
-    image_paths=image_paths,
-    block_idx=23,
-    token_idx=center_token,
-    head_idx=0
-)
-```
-
-### Example 2: 比較不同 layer 的 attention
-```python
-for block_idx in [0, 12, 23]:  # Early, middle, deep
-    demo_visualize_token_attention(
-        image_paths=image_paths,
-        block_idx=block_idx,
-        token_idx=500,
-        head_idx=0,
-        attention_types=['global']
-    )
-```
-
-### Example 3: 比較不同 attention head
-```python
-for head_idx in range(16):
-    demo_visualize_token_attention(
-        image_paths=image_paths,
-        block_idx=23,
-        token_idx=500,
-        head_idx=head_idx,
-        attention_types=['frame']
-    )
-```
-
-## 技術細節
-
-### Hook 機制
-使用 PyTorch 的 `register_forward_hook` 來攔截 forward pass：
-
-```python
-def hook_fn(module, input, output):
-    # 手動計算 attention weights
-    x = input[0]
-    q, k, v = compute_qkv(x)
-    attn_weights = softmax(q @ k.T)
-    # 儲存結果
-    self.attention_maps[layer_name] = attn_weights
-```
-
-### 為什麼需要手動計算？
+### 為什麼需要手動計算attention？
 VGGT 使用 **fused attention** 來優化效能，這種實作不會返回中間的 attention weights。因此我們需要：
 1. 用 hook 攔截輸入
 2. 手動重新計算 Q, K
 3. 計算 `softmax(QK^T)` 得到 attention map
 
-### Global Attention 的 Frame 分離
-Global attention 的 shape 是 `[B, num_heads, S*P, S*P]`，其中 tokens 按以下順序排列：
+## 範例
+每個block有一個frame attention和global attention
+要先對 block `extract_both_attentions`
+再看要frame attention的value或global attention的value
+
 ```
-[frame0_patch0, frame0_patch1, ..., frame1_patch0, frame1_patch1, ...]
+看 demo_attention.ipynb
+
+
 ```
 
-要分離每一幀的 attention：
-```python
-attn = attn_weights[0, head_idx, token_idx, patch_start_idx:]
-attn_per_frame = attn.reshape(S, num_patches)  # [S, P]
-```
+
 
 ## 常見問題
 
@@ -391,20 +336,45 @@ attn_per_frame = attn.reshape(S, num_patches)  # [S, P]
 
   你要的"第2個frame的token"應該這樣計算：
 
+### frame_2_block_20_token_820_global_attn.png為什麼上標會寫token 1750?不是token 820嗎
+  Token Index 的兩種表示方式：
+
+  1. Frame Attention（相對 index）： Token 820
+    - 這是在 Frame 2 內部的第 820 個 token
+    - 範圍：0 到 (tokens_per_frame - 1)
+  2. Global Attention（絕對 index）： Token 1750
+    - 這是在所有 frames 合併後的第 1750 個 token
+    - 計算公式：global_token_idx = frame_idx × tokens_per_frame + token_in_frame
+
+  為什麼是 1750？
+
+  讓我算給你看：
+
+  frame_idx = 1  # 第2個frame (0-based)
+  token_in_frame = 820
+  tokens_per_frame = ?  # 需要知道每個frame有多少tokens
+
+  #### 從 1750 反推
+  global_token_idx = 1750
+  1750 = 1 × tokens_per_frame + 820
+  tokens_per_frame = 1750 - 820 = 930
+
+  所以你的圖像每個 frame 有 930 個 tokens。
+
+  Token 排列順序（Global Attention）：
+  Frame 1 (index 0): tokens [0    - 929]
+  Frame 2 (index 1): tokens [930  - 1859]  ← Token 1750 在這裡 (930 + 820)
+  Frame 3 (index 2): tokens [1860 - 2789]
+
+  視覺化標題的意義：
+  - Frame attention 圖：顯示 820（該 frame 內的相對位置）
+  - Global attention 圖：顯示 1750（跨所有 frames 的絕對位置）
+
+  兩個都是正確的，只是參考系不同！這樣清楚了嗎？
 
 ### Q: 為什麼我的 token_idx 被自動調整了？
 A: token_idx 必須在有效範圍內（>= patch_start_idx 且 < patch_start_idx + num_patches）。如果超出範圍，會自動調整到最近的有效值。
 
-### Q: 為什麼 attention map 看起來很模糊？
-A: Attention map 的原始解析度是 37x37（對應 patch grid），我們使用 bilinear interpolation 放大到原始影像尺寸。
-
-### Q: 如何儲存結果？
-A:
-```python
-figures, result = demo_visualize_token_attention(...)
-figures[0][1].savefig('frame_attention.png', dpi=300, bbox_inches='tight')
-figures[1][1].savefig('global_attention.png', dpi=300, bbox_inches='tight')
-```
 
 ### Q: 可以提取多個 block 的 attention 嗎？
 A: 可以！
@@ -419,14 +389,3 @@ with torch.no_grad():
     _ = model(images)
 attention_maps = extractor.get_attention_maps()
 ```
-
-## 效能建議
-
-1. **記憶體使用**：Attention maps 很大，建議一次只處理一個 block
-2. **計算開銷**：手動計算 attention 會增加約 20-30% 的計算時間
-3. **清理 hooks**：使用完畢後記得呼叫 `extractor.clear_hooks()` 來移除 hooks
-
-## 參考資料
-
-- VGGT Paper: [Visual Geometry Grounded Transformer]
-- PyTorch Hooks: [torch.nn.Module.register_forward_hook](https://pytorch.org/docs/stable/generated/torch.nn.Module.register_forward_hook.html)
