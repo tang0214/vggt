@@ -369,6 +369,29 @@ attn_per_frame = attn.reshape(S, num_patches)  # [S, P]
 
 ## 常見問題
 
+### fastvggt官網 token 20820怎麼來的
+
+![alt text](attention_map.png)
+● 明白了！現在我懂了。根據你提供的資訊：
+
+  ScanNet 數據集的 Token 結構：
+  - 每個 image = 1,041 tokens (1 camera + 4 register + 1,036 patch tokens，28×37 grid)
+  - 如果有 N 個 frames，Global Attention 的總 token 數 = N × 1,041
+
+  Token 20280 的計算：
+  #### Token 20280 在哪個 frame？
+  tokens_per_frame = 1041
+  frame_idx = 20280 // tokens_per_frame  # = 19 (第20個frame)
+  token_in_frame = 20280 % tokens_per_frame  # = 459 (該frame中的第459個token)
+
+  #### 如果要找patch位置（patch tokens從index 5開始）
+  patch_idx = token_in_frame - 5  # = 454
+  row = patch_idx // 37  # = 12
+  col = patch_idx % 37   # = 10
+
+  你要的"第2個frame的token"應該這樣計算：
+
+
 ### Q: 為什麼我的 token_idx 被自動調整了？
 A: token_idx 必須在有效範圍內（>= patch_start_idx 且 < patch_start_idx + num_patches）。如果超出範圍，會自動調整到最近的有效值。
 
