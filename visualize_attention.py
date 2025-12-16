@@ -217,6 +217,9 @@ def visualize_attention_on_image(
         # Remove special tokens (only keep patch tokens)
         attn_patches = attn[patch_start_idx:patch_start_idx + num_patches]
 
+        # Re-normalize: original attention was softmax over ALL tokens (including special tokens)
+        attn_patches = attn_patches / (attn_patches.sum() + 1e-8)
+
         # Reshape to spatial grid
         attn_map = attn_patches.reshape(grid_h, grid_w)
 
@@ -246,12 +249,31 @@ def visualize_attention_on_image(
         plt.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04, label='Attention Weight')
 
     elif attention_type == 'global':
-        # Global attention: [B, num_heads, S*P+special_tokens, S*P+special_tokens]
-        # Extract attention for the specified token
+        # Global attention: [B, num_heads, S*P, S*P] where P = tokens per frame
+        # Token layout: [frame0_tokens, frame1_tokens, ..., frameS-1_tokens]
+        # Each frame_tokens = [camera, registers, patches]
+
         attn = attn_weights[0, head_idx, token_idx, :].numpy()
 
-        # Remove special tokens and reshape to [S, P]
-        attn_patches = attn[patch_start_idx:patch_start_idx + S * num_patches]
+        # Calculate tokens per frame
+        total_tokens = attn.shape[0]
+        tokens_per_frame = total_tokens // S
+
+        # Extract patch tokens from each frame separately (skip camera & register tokens)
+        attn_patches_list = []
+        for frame_idx in range(S):
+            frame_start = frame_idx * tokens_per_frame
+            patches_start = frame_start + patch_start_idx
+            patches_end = patches_start + num_patches
+            attn_patches_list.append(attn[patches_start:patches_end])
+
+        # Concatenate all patch tokens
+        attn_patches = np.concatenate(attn_patches_list)
+
+        # Re-normalize: original attention was softmax over ALL tokens (including special tokens)
+        attn_patches = attn_patches / (attn_patches.sum() + 1e-8)
+
+        # Reshape to [S, num_patches]
         attn_per_frame = attn_patches.reshape(S, num_patches)
 
         # Create subplot for each frame
@@ -363,6 +385,9 @@ def get_attention_values(
         # Remove special tokens (only keep patch tokens)
         attn_patches = attn[patch_start_idx:patch_start_idx + num_patches]
 
+        # Re-normalize: original attention was softmax over ALL tokens (including special tokens)
+        attn_patches = attn_patches / (attn_patches.sum() + 1e-8)
+
         # Reshape to spatial grid [grid_h, grid_w]
         attn_map = attn_patches.reshape(grid_h, grid_w)
 
@@ -378,12 +403,31 @@ def get_attention_values(
         result['attention_maps_resized'] = attn_resized
 
     elif attention_type == 'global':
-        # Global attention: [B, num_heads, S*P+special_tokens, S*P+special_tokens]
-        # Extract attention for the specified token
+        # Global attention: [B, num_heads, S*P, S*P] where P = tokens per frame
+        # Token layout: [frame0_tokens, frame1_tokens, ..., frameS-1_tokens]
+        # Each frame_tokens = [camera, registers, patches]
+
         attn = attn_weights[0, head_idx, token_idx, :].numpy()
 
-        # Remove special tokens and reshape to [S, P]
-        attn_patches = attn[patch_start_idx:patch_start_idx + S * num_patches]
+        # Calculate tokens per frame
+        total_tokens = attn.shape[0]
+        tokens_per_frame = total_tokens // S
+
+        # Extract patch tokens from each frame separately (skip camera & register tokens)
+        attn_patches_list = []
+        for frame_idx in range(S):
+            frame_start = frame_idx * tokens_per_frame
+            patches_start = frame_start + patch_start_idx
+            patches_end = patches_start + num_patches
+            attn_patches_list.append(attn[patches_start:patches_end])
+
+        # Concatenate all patch tokens
+        attn_patches = np.concatenate(attn_patches_list)
+
+        # Re-normalize: original attention was softmax over ALL tokens (including special tokens)
+        attn_patches = attn_patches / (attn_patches.sum() + 1e-8)
+
+        # Reshape to [S, num_patches]
         attn_per_frame = attn_patches.reshape(S, num_patches)
 
         # Reshape each frame to spatial grid [S, grid_h, grid_w]
@@ -481,6 +525,9 @@ def get_all_frames_attention(
         # Remove special tokens
         attn_patches = attn[patch_start_idx:patch_start_idx + num_patches]
 
+        # Re-normalize: original attention was softmax over ALL tokens (including special tokens)
+        attn_patches = attn_patches / (attn_patches.sum() + 1e-8)
+
         # Reshape to spatial grid
         attn_map = attn_patches.reshape(grid_h, grid_w)
 
@@ -550,6 +597,10 @@ def visualize_frame_attention(
     # Extract attention for specified frame
     attn = attn_weights[frame_idx, head_idx, token_idx, :].numpy()
     attn_patches = attn[patch_start_idx:patch_start_idx + num_patches]
+
+    # Re-normalize: original attention was softmax over ALL tokens (including special tokens)
+    attn_patches = attn_patches / (attn_patches.sum() + 1e-8)
+
     attn_map = attn_patches.reshape(grid_h, grid_w)
 
     # Create visualization
